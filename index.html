@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Eraser-DSL Flow-Chart Demo (DagreJS)</title>
+    <!-- Tailwind CSS via CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- D3.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+    <!-- DagreJS (Umd exposes global "dagre") -->
+    <script src="https://unpkg.com/@dagrejs/dagre@1.0.4/dist/dagre.min.js"></script>
+
+    <style>
+      html,
+      body {
+        height: 100%;
+      }
+
+      svg {
+        overflow: visible;
+      }
+
+      /* ---------- Edge styling ---------- */
+      path.edge {
+        fill: none;
+        stroke: #4b5563; /* gray-600 */
+        stroke-width: 2px;
+        stroke-linejoin: round;
+      }
+
+      /* ---------- Arrowhead ---------- */
+      marker#arrow path {
+        fill: #4b5563;
+        stroke: none;
+      }
+
+      /* ---------- Node styling ---------- */
+      .node rect {
+        rx: 12px;
+        ry: 12px;
+        fill: #ffffff;
+        stroke: #2563eb; /* blue-600 */
+        stroke-width: 2;
+        filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.1));
+      }
+      .node text {
+        font-weight: 600;
+        fill: #1f2937; /* gray-800 */
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body class="bg-slate-100 min-h-screen flex justify-center p-6">
+    <!-- Two-column workspace -->
+    <div
+      class="w-full max-w-7xl flex flex-col md:flex-row gap-6 flex-1 min-h-0"
+    >
+      <!-- Renderer (left) -->
+      <div
+        class="flex-1 md:basis-2/3 bg-white rounded-2xl shadow p-4 overflow-hidden min-h-0"
+      >
+        <svg id="svg" class="w-full h-full"></svg>
+      </div>
+
+      <!-- DSL editor (right) -->
+      <div class="flex flex-col flex-1 md:basis-1/3 min-h-0">
+        <textarea
+          id="dslInput"
+          class="w-full flex-1 h-full font-mono text-sm rounded-xl border border-gray-300 p-3 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+        ></textarea>
+      </div>
+    </div>
+
+    <script>
+      /* --------------------- Flow-Chart DSL Parser --------------------- */
+      function parseFlowchart(src) {
+        const lines = src.split(/\r?\n/);
+        const ast = { type: "Flowchart", nodes: [], edges: [] };
+        const stack = [ast]; // current group context
+
+        const top = () => stack[stack.length - 1];
+        const addNode = (n) => {
+          if (!top().nodes) top().nodes = [];
+          top().nodes.push(n);
+        };
+
+        const parseAttrs = (raw = "") => {
+          const attrs = {};
+          if (!raw || !raw.trim()) return attrs;
+          for (const part of raw.split(",")) {
+            const [k, v] = part.split(":").map((s) => s.trim());
+            if (k) attrs[k] = v ?? true;
+          }
+          return attrs;
+        };
+
+        const EDGE_RE = /^(.+?)\s*(?:->|>)\s*(.+?)(?::\s*(.*))?$/;
+        const GROUP_OPEN_RE = /^([^\[{]+?)\s*(\[[^\]]+])?\s*\{$/;
+        const NODE_RE = /^([^\[]+?)\s*(\[[^\]]+])?$/;
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line || line.startsWith("//")) continue; // comments & blanks
+
+          if (line === "}") {
+            stack.pop();
+            continue;
+          }
+
+          // edge
+          if (EDGE_RE.test(line) && !line.endsWith("{")) {
+            const [, from, to, label] = EDGE_RE.exec(line);
+            ast.edges.push({
+              from: from.trim(),
+              to: to.trim(),
+              ...(label ? { label: label.trim() } : {}),
+            });
+            continue;
+          }
+
+          // group
+          if (GROUP_OPEN_RE.test(line)) {
+            const [, name, attrBlock] = GROUP_OPEN_RE.exec(line);
+            const group = {
+              type: "Group",
+              label: name.trim(),
+              attrs: parseAttrs(attrBlock?.slice(1, -1)),
+              nodes: [],
+            };
+            addNode(group);
+            stack.push(group);
+            continue;
+          }
+
+          // node
+          if (NODE_RE.test(line)) {
+            const [, name, attrBlock] = NODE_RE.exec(line);
+            addNode({
+              type: "Node",
+              label: name.trim(),
+              attrs: parseAttrs(attrBlock?.slice(1, -1)),
+            });
+            continue;
+          }
+
+          throw new Error(`Unrecognised syntax: "${line}"`);
+        }
+
+        if (stack.length !== 1) throw new Error("Unbalanced braces in input");
+        return ast;
+      }
+
+      /* --------------------- Build Dagre graph from DSL --------------------- */
+      function buildGraphFromDsl(dsl, direction = "TB") {
+        const ast = parseFlowchart(dsl);
+        const g = new dagre.graphlib.Graph({ compound: true })
+          .setGraph({ rankdir: direction, nodesep: 40, ranksep: 80 })
+          .setDefaultEdgeLabel(() => ({}));
+
+        const walk = (node, parent = null) => {
+          if (node.type === "Node") {
+            g.setNode(node.label, {
+              label: node.label,
+              width: 110,
+              height: 48,
+              ...node.attrs,
+            });
+            if (parent) g.setParent(node.label, parent);
+          } else if (node.type === "Group") {
+            g.setNode(node.label, { clusterLabel: node.label });
+            if (parent) g.setParent(node.label, parent);
+            node.nodes.forEach((child) => walk(child, node.label));
+          }
+        };
+
+        ast.nodes.forEach((n) => walk(n));
+        ast.edges.forEach((e) => g.setEdge(e.from, e.to, { label: e.label }));
+
+        dagre.layout(g);
+        return g;
+      }
+
+      /* --------------------- Helper: Fit SVG viewBox --------------------- */
+      function fitViewBox(g, svg, inner) {
+        // Only consider visible (non-cluster) nodes
+        const nodes = g
+          .nodes()
+          .filter((id) => !g.node(id).clusterLabel)
+          .map((id) => g.node(id));
+        if (!nodes.length) return;
+
+        const margin = 40;
+        const minX = d3.min(nodes, (n) => n.x - n.width / 2) - margin;
+        const maxX = d3.max(nodes, (n) => n.x + n.width / 2) + margin;
+        const minY = d3.min(nodes, (n) => n.y - n.height / 2) - margin;
+        const maxY = d3.max(nodes, (n) => n.y + n.height / 2) + margin;
+
+        // Preserve any zoom transform already applied
+        const prevTransform = inner.attr("transform");
+        svg.attr("viewBox", [minX, minY, maxX - minX, maxY - minY]);
+        if (prevTransform) inner.attr("transform", prevTransform);
+      }
+
+      /* --------------------- Render Dagre graph to SVG --------------------- */
+      function render(g, container, svg) {
+        // Define arrowheads once
+        if (svg.select("marker#arrow").empty()) {
+          svg
+            .append("defs")
+            .append("marker")
+            .attr("id", "arrow")
+            .attr("viewBox", "0 0 10 10")
+            .attr("refX", 9)
+            .attr("refY", 5)
+            .attr("markerWidth", 6)
+            .attr("markerHeight", 6)
+            .attr("orient", "auto")
+            .append("path")
+            .attr("d", "M 0 0 L 10 5 L 0 10 z");
+        }
+
+        /* ---------- Data joins ---------- */
+        const edgeSel = container
+          .selectAll("path.edge")
+          .data(g.edges(), (d) => `${d.v}-${d.w}`);
+        edgeSel.exit().remove();
+        edgeSel
+          .enter()
+          .append("path")
+          .classed("edge", true)
+          .attr("marker-end", "url(#arrow)")
+          .merge(edgeSel)
+          .attr("d", (d) => {
+            const line = d3
+              .line()
+              .x((p) => p.x)
+              .y((p) => p.y)
+              .curve(d3.curveMonotoneX);
+            return line(g.edge(d).points);
+          });
+
+        // Filter out cluster nodes (groups)
+        const visibleNodes = g.nodes().filter((id) => !g.node(id).clusterLabel);
+
+        const nodeSel = container
+          .selectAll("g.node")
+          .data(visibleNodes, (d) => d);
+        const nodeEnter = nodeSel.enter().append("g").classed("node", true);
+        nodeEnter.append("rect");
+        nodeEnter
+          .append("text")
+          .attr("dy", "0.35em")
+          .attr("text-anchor", "middle");
+        nodeSel.exit().remove();
+        nodeEnter.merge(nodeSel).each(function (d) {
+          const n = g.node(d);
+          const sel = d3.select(this);
+          sel.attr(
+            "transform",
+            `translate(${n.x - n.width / 2}, ${n.y - n.height / 2})`
+          );
+          sel.select("rect").attr("width", n.width).attr("height", n.height);
+          sel
+            .select("text")
+            .attr("x", n.width / 2)
+            .attr("y", n.height / 2)
+            .text(n.label);
+        });
+
+        // Fit SVG to graph bounds
+        fitViewBox(g, svg, container);
+      }
+
+      /* --------------------- App bootstrapping --------------------- */
+      const svg = d3.select("#svg");
+      const inner = svg.append("g").classed("inner", true);
+
+      // zoom behaviour
+      svg.call(
+        d3
+          .zoom()
+          .scaleExtent([0.5, 4])
+          .on("zoom", (event) => inner.attr("transform", event.transform))
+      );
+
+      // textarea & live render
+      const textarea = document.getElementById("dslInput");
+
+      // Store last graph for resize handling
+      let lastGraph = null;
+
+      const sampleDsl = `// Nodes and groups
+Issue type? [shape: oval, icon: file-text]
+
+BugPath [color: red] {
+  Bug [icon: bug, color: red]
+  Duplicate? [shape: diamond, icon: copy]
+  Mark duplicate [shape: oval, icon: copy]
+  Has repro? [shape: diamond, icon: repeat]
+  Ask for repro [shape: oval, icon: repeat]
+}
+
+FeaturePath [color: green] {
+  Feature [icon: zap, color: green]
+  Well specced? [shape: diamond, icon: check-square]
+  Can be package? [shape: diamond, icon: package]
+  Define as package [shape: oval, icon: package]
+}
+
+Issue ready to claim [shape: oval, icon: send]
+
+// Relationships
+Issue type? > Bug
+Bug > Duplicate?
+Duplicate? > Mark duplicate: Yes
+Duplicate? > Has repro?: No
+Has repro? > Issue ready to claim: Yes
+Has repro? > Ask for repro: No
+Issue type? > Feature
+Feature > Can be package?
+Can be package? > Well specced?: No
+Can be package? > Define as package: Yes
+Well specced? > Issue ready to claim: Yes`;
+
+      textarea.value = sampleDsl.trim();
+
+      function tryRender() {
+        const src = textarea.value;
+        try {
+          const graph = buildGraphFromDsl(src, "TB");
+          lastGraph = graph; // store for later resize
+          inner.selectAll("*").remove(); // clear any stale error text
+          render(graph, inner, svg);
+        } catch (err) {
+          // show error
+          inner.selectAll("*").remove();
+          inner
+            .append("text")
+            .attr("x", 10)
+            .attr("y", 24)
+            .attr("font-size", "14px")
+            .attr("fill", "#dc2626") // red-600
+            .text(err.message);
+          svg.attr("viewBox", [0, 0, 600, 100]); // fallback viewBox
+        }
+      }
+
+      textarea.addEventListener("input", tryRender);
+
+      // initial render
+      tryRender();
+
+      // Refit viewBox on window resize
+      window.addEventListener("resize", () => {
+        if (lastGraph) fitViewBox(lastGraph, svg, inner);
+      });
+    </script>
+  </body>
+</html>
